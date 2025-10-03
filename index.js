@@ -30,13 +30,6 @@ function webhookHost(urlStr) {
   }
 }
 
-// "Имя [243822]" -> 243822
-function extractUserId(s) {
-  if (typeof s !== "string") return null;
-  const m = s.match(/\[(\d+)\]/);
-  return m ? Number(m[1]) : null;
-}
-
 // ---------- Работа с датой (строго по календарю, без TZ) ----------
 function parseDateParts(s) {
   if (!s) return null;
@@ -49,7 +42,7 @@ function parseDateParts(s) {
   m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})(?:\s+\d{2}:\d{2}:\d{2})?$/);
   if (m) return { year: +m[3], month: +m[2], day: +m[1] };
 
-  // Фолбэк — попытаемся распарсить и взять календарные части
+  // Фолбэк — возьмём календарные части из Date
   const d = new Date(s);
   if (!Number.isNaN(d.getTime())) {
     return { year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate() };
@@ -66,7 +59,7 @@ function fmtYMD({ year, month, day }) {
 function toYmd(s) {
   if (!s || typeof s !== "string") return null;
 
-  // ISO-like, берём первые 10 символов YYYY-MM-DD
+  // ISO-like YYYY-MM-DD(…)
   let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
 
@@ -84,45 +77,108 @@ function toYmd(s) {
   }
   return null;
 }
-
-// Приводим любой формат EXCLUSIONS к массиву однотипных элементов
-// Поддерживаем:
-//   "YYYY-MM-DD"
-//   { DATE: "YYYY-MM-DD" }
-//   { DATE_FROM: "YYYY-MM-DD", DATE_TO: "YYYY-MM-DD" }
-//   Массивы этих вариантов; "[]", "", null, {} -> []
-function normalizeExclusions(raw) {
+function safeParseJSON(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+// Приводим что угодно к массиву (вскрываем строковые JSON)
+function normalizeToArray(raw) {
   if (raw == null) return [];
-  let arr = [];
-
-  if (Array.isArray(raw)) {
-    arr = raw;
-  } else if (typeof raw === "string") {
-    const s = raw.trim();
-    if (!s || s === "[]") return [];
-    try {
-      const parsed = JSON.parse(s);
-      if (Array.isArray(parsed)) arr = parsed;
-      else if (parsed && typeof parsed === "object") arr = [parsed];
-      else return [];
-    } catch {
-      // Не JSON — игнорируем
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    const t = raw.trim();
+    if (!t) return [];
+    if (/^[\[\{]/.test(t)) {
+      const parsed = safeParseJSON(t);
+      if (Array.isArray(parsed)) return parsed;
+      if (parsed && typeof parsed === "object") return [parsed];
       return [];
     }
-  } else if (typeof raw === "object") {
-    arr = [raw];
-  } else {
-    return [];
+    return [t]; // строка-дата или строка-диапазон
   }
+  if (typeof raw === "object") return [raw];
+  return [];
+}
 
+// Выдаёт массив объектов:
+// { type: "single", date: "YYYY-MM-DD" } или { type: "range", from: "YYYY-MM-DD", to: "YYYY-MM-DD" }
+function normalizeExclusions(raw) {
+  // helper’ы
+  const queue = normalizeToArray(raw);
   const norm = [];
-  for (const e of arr) {
+
+  // Специальный парсер карты: { "2025": { "10": { "3": "0", ... } } }
+  const tryCalendarMap = (obj) => {
+    let found = false;
+    for (const y of Object.keys(obj || {})) {
+      const ym = obj[y];
+      if (ym && typeof ym === "object") {
+        for (const m of Object.keys(ym)) {
+          const md = ym[m];
+          if (md && typeof md === "object") {
+            for (const d of Object.keys(md)) {
+              // значение обычно "0" -> выходной; ключи — числа-строки
+              const yyyy = String(y).padStart(4, "0");
+              const mm = String(m).padStart(2, "0");
+              const dd = String(d).padStart(2, "0");
+              norm.push({ type: "single", date: `${yyyy}-${mm}-${dd}` });
+              found = true;
+            }
+          }
+        }
+      }
+    }
+    return found;
+  };
+
+  while (queue.length) {
+    const e = queue.shift();
+
+    // строка-JSON — раскрываем
+    if (typeof e === "string" && /^[\[\{]/.test(e.trim())) {
+      const parsed = safeParseJSON(e.trim());
+      if (parsed != null) {
+        const arr = normalizeToArray(parsed);
+        queue.push(...arr);
+        continue;
+      }
+    }
+
+    // строка-диапазон "YYYY-MM-DD to YYYY-MM-DD" / "YYYY-MM-DD - YYYY-MM-DD"
     if (typeof e === "string") {
+      const range = e.match(
+        /^(\d{4}-\d{2}-\d{2})\s*(?:to|-|—)\s*(\d{4}-\d{2}-\d{2})$/i
+      );
+      if (range) {
+        const from = toYmd(range[1]);
+        const to = toYmd(range[2]);
+        if (from && to) {
+          norm.push({ type: "range", from, to });
+          continue;
+        }
+      }
       const ymd = toYmd(e);
-      if (ymd) norm.push({ type: "single", date: ymd });
+      if (ymd) {
+        norm.push({ type: "single", date: ymd });
+      }
       continue;
     }
+
+    // объект
     if (e && typeof e === "object") {
+      // 1) Прямо карта календаря {YYYY:{MM:{DD:"0"}}}
+      if (tryCalendarMap(e)) continue;
+
+      // 2) Вложенный массив исключений
+      if (Array.isArray(e.EXCLUSIONS)) {
+        queue.push(...e.EXCLUSIONS);
+        continue;
+      }
+
+      // 3) Обычные формы объектов
       if (typeof e.DATE === "string") {
         const ymd = toYmd(e.DATE);
         if (ymd) norm.push({ type: "single", date: ymd });
@@ -134,16 +190,66 @@ function normalizeExclusions(raw) {
         norm.push({ type: "range", from, to });
         continue;
       }
+
+      // 4) Обойти вложенные поля (вдруг там строки/массивы/объекты)
+      for (const v of Object.values(e)) {
+        const arr = normalizeToArray(v);
+        if (arr.length) queue.push(...arr);
+      }
+      continue;
     }
   }
-  return norm;
+
+  // Дедуп
+  const seenSingles = new Set();
+  const seenRanges = new Set();
+  const dedup = [];
+  for (const it of norm) {
+    if (it.type === "single") {
+      const key = `S|${it.date}`;
+      if (!seenSingles.has(key)) {
+        seenSingles.add(key);
+        dedup.push(it);
+      }
+    } else if (it.type === "range") {
+      const key = `R|${it.from}|${it.to}`;
+      if (!seenRanges.has(key)) {
+        seenRanges.add(key);
+        dedup.push(it);
+      }
+    }
+  }
+  return dedup;
 }
 
 // Рабочий день = дата НЕ входит в EXCLUSIONS
-function isWorkingDayByExclusions(schedule, ymd) {
+function isWorkingDayByExclusions(schedule, ymd, debug = false, sid = null) {
   const raw = schedule?.CALENDAR?.EXCLUSIONS;
+  const calendarId = schedule?.CALENDAR?.ID ?? schedule?.CALENDAR_ID ?? null;
   const excl = normalizeExclusions(raw);
-  if (!excl.length) return true; // нет исключений => все даты рабочие
+  if (debug) {
+    const sampleSingles = excl
+      .filter((x) => x.type === "single")
+      .slice(0, 5)
+      .map((x) => x.date);
+    const sampleRanges = excl
+      .filter((x) => x.type === "range")
+      .slice(0, 3)
+      .map((x) => `${x.from}..${x.to}`);
+    logMessage(
+      "info",
+      "shift-check",
+      `Calendar debug: scheduleId=${
+        sid ?? "?"
+      }, calendarId=${calendarId}, exclSingles=${
+        sampleSingles.length
+      } [${sampleSingles.join(", ")}], exclRanges=${
+        sampleRanges.length
+      } [${sampleRanges.join(", ")}]`
+    );
+  }
+
+  if (!excl.length) return true; // нет исключений => день рабочий
 
   const hit = excl.some((item) => {
     if (item.type === "single") return item.date === ymd;
@@ -185,7 +291,8 @@ async function startWorkflow({
   const payload = {
     TEMPLATE_ID: Number(bpTemplateId),
     DOCUMENT_ID: documentId,
-    PARAMETERS: { smena: Number(scheduleId == 6 ? 1 : 2) }, // передаём ID графика (6 или 4)
+    // передаём флаг смены: 1 для графика 6, 2 для графика 4 (как у тебя было)
+    PARAMETERS: { smena: Number(scheduleId == 6 ? 1 : 2) },
   };
   const { data } = await axios.post(url, payload, { timeout: 15000 });
   if (!data || data.error) {
@@ -219,39 +326,27 @@ app.get("/health", (req, res) => res.status(200).send("OK"));
  * Параметры из QUERY-строки (GET/POST/…):
  *  b24WebhookUrl=https://portal.bitrix24.kz/rest/USER/TOKEN/
  *  leadId=398494
- *  scheduleId1=Сергей%20Интегратор%20[243822]
- *  scheduleId2=Game%20Changer%20[150300]
  *  date=03.10.2025%2000:00:00   (или YYYY-MM-DD)
  *  bpTemplateId=45              (опционально, иначе из .env)
+ *  debug=1                      (опционально: вернуть доп. диагностику в логах)
  *
  * Логика:
- *  - извлекаем uid1/uid2 из scheduleId1/2 (для логов)
  *  - проверяем графики 6, затем 4
  *  - рабочий день: дата НЕ в CALENDAR.EXCLUSIONS
- *  - на первом «рабочем» графике запускаем БП на лиде; параметр smena = ID графика
+ *  - на первом «рабочем» графике запускаем БП на лиде; параметр smena = 1 (для 6) или 2 (для 4)
  */
 app.all("/qg_shifts_webhook/shift-check", async (req, res) => {
   try {
-    const {
-      b24WebhookUrl,
-      leadId,
-      scheduleId1, // "Имя [ID]" (ID сотрудника, для логов)
-      scheduleId2, // "Имя [ID]"
-      date,
-      bpTemplateId,
-    } = req.query || {};
+    const { b24WebhookUrl, leadId, date, bpTemplateId, debug } =
+      req.query || {};
 
-    if (!b24WebhookUrl || !leadId || !scheduleId1 || !scheduleId2 || !date) {
-      return res.status(400).json({
-        error:
-          "Required query params: b24WebhookUrl, leadId, scheduleId1, scheduleId2, date",
-      });
+    if (!b24WebhookUrl || !leadId || !date) {
+      return res
+        .status(400)
+        .json({ error: "Required query params: b24WebhookUrl, leadId, date" });
     }
 
     const host = webhookHost(String(b24WebhookUrl));
-    const userId1 = extractUserId(String(scheduleId1));
-    const userId2 = extractUserId(String(scheduleId2));
-
     const dateParts = parseDateParts(String(date));
     if (!dateParts) {
       return res.status(400).json({
@@ -259,23 +354,24 @@ app.all("/qg_shifts_webhook/shift-check", async (req, res) => {
       });
     }
     const ymd = fmtYMD(dateParts);
+    const dbg = String(debug || "") === "1";
 
     logMessage(
       "info",
       "shift-check",
-      `Request received: host=${host}, leadId=${leadId}, s1=${scheduleId1} -> uid1=${userId1}, s2=${scheduleId2} -> uid2=${userId2}, date=${ymd}`
+      `Request received: host=${host}, leadId=${leadId}, date=${ymd}, debug=${dbg}`
     );
 
     const webhookBase = normalizeWebhookBase(String(b24WebhookUrl));
     const tplId = bpTemplateId ? Number(bpTemplateId) : BP_TEMPLATE_ID;
     const documentId = buildDocumentIdForLead(leadId);
 
-    // Требование: проверяем ровно графики ID 6 и 4 — по порядку
+    // Проверяем ровно графики ID 6 и 4 — по порядку
     const schedulesToCheck = [6, 4];
 
     for (const sid of schedulesToCheck) {
       const schedule = await getSchedule(webhookBase, sid);
-      const working = isWorkingDayByExclusions(schedule, ymd);
+      const working = isWorkingDayByExclusions(schedule, ymd, dbg, sid);
       logMessage(
         "info",
         "shift-check",
@@ -289,19 +385,16 @@ app.all("/qg_shifts_webhook/shift-check", async (req, res) => {
           bpTemplateId: tplId,
           documentId,
         });
-
         logMessage(
           "info",
           "shift-check",
-          `Bizproc started: workflowId=${workflowId}, scheduleId=${sid}, leadId=${leadId}, users=[${userId1},${userId2}], date=${ymd}`
+          `Bizproc started: workflowId=${workflowId}, scheduleId=${sid}, leadId=${leadId}, date=${ymd}`
         );
-
         return res.json({
           ok: true,
           workingScheduleId: sid,
           workflowId,
           documentId,
-          users: [userId1, userId2],
           date: ymd,
         });
       }
@@ -313,7 +406,6 @@ app.all("/qg_shifts_webhook/shift-check", async (req, res) => {
       workingScheduleId: null,
       message: "Выходной по обоим графикам (6 и 4)",
       documentId,
-      users: [userId1, userId2],
       date: ymd,
     });
   } catch (e) {
